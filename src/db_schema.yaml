@@ -1,0 +1,585 @@
+# ============================================
+# Схема базы данных bank_test
+# PostgreSQL - Банковская сфера
+# ============================================
+
+database: bank_test
+dialect: postgresql
+
+tables:
+  # ============================================
+  # Справочники
+  # ============================================
+  
+  - table_id: mcc_codes
+    table_name: mcc_codes
+    description: Справочник MCC-кодов (категории торговых точек)
+    schema: public
+    columns:
+      - name: mcc_code
+        type: TEXT
+        primary_key: true
+        description: Код категории (4 цифры)
+      - name: description
+        type: TEXT
+        nullable: false
+        description: Описание категории
+      - name: category
+        type: TEXT
+        nullable: false
+        description: Группа категории (retail, restaurant, fuel, services, entertainment)
+      - name: risk_level
+        type: TEXT
+        nullable: false
+        default: low
+        description: Уровень риска (low, medium, high)
+    sample_query: SELECT * FROM mcc_codes LIMIT 5;
+  
+  # ============================================
+  # Клиенты
+  # ============================================
+  
+  - table_id: customers
+    table_name: customers
+    description: Клиенты банка (физические и юридические лица)
+    schema: public
+    columns:
+      - name: customer_id
+        type: SERIAL
+        primary_key: true
+        description: Уникальный идентификатор клиента
+      - name: customer_type
+        type: TEXT
+        nullable: false
+        description: Тип клиента (individual - физ лицо, legal - юр лицо)
+      - name: name
+        type: TEXT
+        nullable: false
+        description: Наименование/ФИО клиента
+      - name: inn
+        type: TEXT
+        nullable: true
+        description: ИНН (для юр лиц и ИП)
+      - name: kpp
+        type: TEXT
+        nullable: true
+        description: КПП (только для юр лиц)
+      - name: registration_date
+        type: DATE
+        nullable: false
+        default: CURRENT_DATE
+        description: Дата регистрации
+      - name: status
+        type: TEXT
+        nullable: false
+        default: active
+        description: Статус (active, blocked, closed)
+      - name: phone
+        type: TEXT
+        nullable: true
+        description: Телефон
+      - name: email
+        type: TEXT
+        nullable: true
+        description: Email
+    sample_query: SELECT customer_id, customer_type, name, inn FROM customers LIMIT 5;
+  
+  # ============================================
+  # Счета
+  # ============================================
+  
+  - table_id: accounts
+    table_name: accounts
+    description: Банковские счета клиентов
+    schema: public
+    columns:
+      - name: account_id
+        type: SERIAL
+        primary_key: true
+        description: Уникальный идентификатор счёта
+      - name: customer_id
+        type: INTEGER
+        nullable: false
+        foreign_key: customers.customer_id
+        description: Ссылка на клиента
+      - name: account_number
+        type: TEXT
+        nullable: false
+        unique: true
+        description: Номер счёта (20 цифр)
+      - name: currency
+        type: TEXT
+        nullable: false
+        default: RUB
+        description: Валюта счёта (RUB, USD, EUR)
+      - name: account_type
+        type: TEXT
+        nullable: false
+        description: Тип счёта (current - текущий, settlement - расчётный, deposit - депозит, loan - кредитный)
+      - name: balance
+        type: DECIMAL(15,2)
+        nullable: false
+        default: 0
+        description: Остаток на счёте
+      - name: open_date
+        type: DATE
+        nullable: false
+        default: CURRENT_DATE
+        description: Дата открытия счёта
+      - name: status
+        type: TEXT
+        nullable: false
+        default: active
+        description: Статус счёта (active, blocked, closed)
+    sample_query: SELECT a.account_id, a.account_number, a.currency, a.balance, c.name FROM accounts a JOIN customers c ON a.customer_id = c.customer_id LIMIT 5;
+  
+  # ============================================
+  # Карты
+  # ============================================
+  
+  - table_id: cards
+    table_name: cards
+    description: Банковские карты
+    schema: public
+    columns:
+      - name: card_id
+        type: SERIAL
+        primary_key: true
+        description: Уникальный идентификатор карты
+      - name: customer_id
+        type: INTEGER
+        nullable: false
+        foreign_key: customers.customer_id
+        description: Ссылка на владельца карты
+      - name: account_id
+        type: INTEGER
+        nullable: true
+        foreign_key: accounts.account_id
+        description: Ссылка на привязанный счёт
+      - name: card_number_masked
+        type: TEXT
+        nullable: false
+        description: Маскированный номер карты (2200********1234)
+      - name: card_type
+        type: TEXT
+        nullable: false
+        description: Тип карты (debit - дебетовая, credit - кредитная)
+      - name: payment_system
+        type: TEXT
+        nullable: false
+        description: Платёжная система (VISA, MASTERCARD, MIR)
+      - name: expiry_date
+        type: DATE
+        nullable: false
+        description: Срок действия карты
+      - name: cvv_hash
+        type: TEXT
+        nullable: true
+        description: Хэш CVV-кода
+      - name: status
+        type: TEXT
+        nullable: false
+        default: active
+        description: Статус карты (active, blocked, expired, cancelled)
+      - name: issue_date
+        type: DATE
+        nullable: false
+        default: CURRENT_DATE
+        description: Дата выпуска карты
+    sample_query: SELECT card_id, card_number_masked, payment_system, card_type, status FROM cards LIMIT 5;
+  
+  # ============================================
+  # Транзакции по счетам
+  # ============================================
+  
+  - table_id: transactions
+    table_name: transactions
+    description: Транзакции по банковским счетам
+    schema: public
+    columns:
+      - name: transaction_id
+        type: SERIAL
+        primary_key: true
+        description: Уникальный идентификатор транзакции
+      - name: account_id
+        type: INTEGER
+        nullable: false
+        foreign_key: accounts.account_id
+        description: Ссылка на счёт
+      - name: amount
+        type: DECIMAL(15,2)
+        nullable: false
+        description: Сумма транзакции
+      - name: currency
+        type: TEXT
+        nullable: false
+        default: RUB
+        description: Валюта транзакции (RUB, USD, EUR)
+      - name: transaction_type
+        type: TEXT
+        nullable: false
+        description: Тип операции (debit - списание, credit - зачисление)
+      - name: counterparty_account
+        type: TEXT
+        nullable: true
+        description: Счёт контрагента
+      - name: counterparty_name
+        type: TEXT
+        nullable: true
+        description: Наименование контрагента
+      - name: counterparty_inn
+        type: TEXT
+        nullable: true
+        description: ИНН контрагента
+      - name: description
+        type: TEXT
+        nullable: true
+        description: Назначение платежа
+      - name: transaction_date
+        type: TIMESTAMP
+        nullable: false
+        default: CURRENT_TIMESTAMP
+        description: Дата и время транзакции
+      - name: mcc_code
+        type: TEXT
+        nullable: true
+        foreign_key: mcc_codes.mcc_code
+        description: MCC-код (для покупок)
+      - name: status
+        type: TEXT
+        nullable: false
+        default: completed
+        description: Статус (pending, completed, failed, reversed)
+      - name: created_at
+        type: TIMESTAMP
+        nullable: false
+        default: CURRENT_TIMESTAMP
+        description: Время создания записи
+    sample_query: SELECT t.transaction_id, t.amount, t.transaction_type, t.transaction_date, t.description FROM transactions t LIMIT 5;
+  
+  # ============================================
+  # Мерчанты (торговые точки)
+  # ============================================
+  
+  - table_id: merchants
+    table_name: merchants
+    description: Торговые точки (мерчанты), обслуживающие эквайринг
+    schema: public
+    columns:
+      - name: merchant_id
+        type: SERIAL
+        primary_key: true
+        description: Уникальный идентификатор мерчанта
+      - name: customer_id
+        type: INTEGER
+        nullable: false
+        foreign_key: customers.customer_id
+        description: Ссылка на владельца мерчанта
+      - name: merchant_name
+        type: TEXT
+        nullable: false
+        description: Название торговой точки
+      - name: inn
+        type: TEXT
+        nullable: false
+        description: ИНН мерчанта
+      - name: address
+        type: TEXT
+        nullable: true
+        description: Адрес торговой точки
+      - name: category
+        type: TEXT
+        nullable: false
+        description: Категория (retail, restaurant, online, fuel, entertainment, services, other)
+      - name: status
+        type: TEXT
+        nullable: false
+        default: active
+        description: Статус (active, blocked, closed)
+      - name: contract_date
+        type: DATE
+        nullable: false
+        default: CURRENT_DATE
+        description: Дата договора
+      - name: commission_rate
+        type: DECIMAL(5,4)
+        nullable: false
+        default: 0.02
+        description: Ставка комиссии эквайринга
+    sample_query: SELECT m.merchant_id, m.merchant_name, m.category, m.address FROM merchants m LIMIT 5;
+  
+  # ============================================
+  # Терминалы эквайринга
+  # ============================================
+  
+  - table_id: terminals
+    table_name: terminals
+    description: Терминалы эквайринга для приёма карт
+    schema: public
+    columns:
+      - name: terminal_id
+        type: SERIAL
+        primary_key: true
+        description: Уникальный идентификатор терминала
+      - name: merchant_id
+        type: INTEGER
+        nullable: false
+        foreign_key: merchants.merchant_id
+        description: Ссылка на мерчанта
+      - name: terminal_number
+        type: TEXT
+        nullable: false
+        unique: true
+        description: Заводской номер терминала
+      - name: location
+        type: TEXT
+        nullable: true
+        description: Местоположение терминала
+      - name: install_date
+        type: DATE
+        nullable: false
+        default: CURRENT_DATE
+        description: Дата установки
+      - name: status
+        type: TEXT
+        nullable: false
+        default: active
+        description: Статус (active, inactive, maintenance, disabled)
+      - name: model
+        type: TEXT
+        nullable: true
+        description: Модель терминала
+      - name: serial_number
+        type: TEXT
+        nullable: true
+        description: Серийный номер
+    sample_query: SELECT t.terminal_id, t.terminal_number, t.model, m.merchant_name FROM terminals t JOIN merchants m ON t.merchant_id = m.merchant_id LIMIT 5;
+  
+  # ============================================
+  # Эквайринг транзакции
+  # ============================================
+  
+  - table_id: acquiring_transactions
+    table_name: acquiring_transactions
+    description: Транзакции по терминалам эквайринга (оплаты картами)
+    schema: public
+    columns:
+      - name: acquiring_id
+        type: SERIAL
+        primary_key: true
+        description: Уникальный идентификатор эквайринг транзакции
+      - name: terminal_id
+        type: INTEGER
+        nullable: false
+        foreign_key: terminals.terminal_id
+        description: Ссылка на терминал
+      - name: card_mask
+        type: TEXT
+        nullable: false
+        description: Маска карты (2200********1234)
+      - name: amount
+        type: DECIMAL(15,2)
+        nullable: false
+        description: Сумма транзакции
+      - name: currency
+        type: TEXT
+        nullable: false
+        default: RUB
+        description: Валюта (RUB, USD, EUR)
+      - name: transaction_date
+        type: TIMESTAMP
+        nullable: false
+        default: CURRENT_TIMESTAMP
+        description: Дата и время транзакции
+      - name: mcc_code
+        type: TEXT
+        nullable: true
+        foreign_key: mcc_codes.mcc_code
+        description: MCC-код категории мерчанта
+      - name: auth_code
+        type: TEXT
+        nullable: true
+        description: Код авторизации
+      - name: rrn
+        type: TEXT
+        nullable: true
+        description: RRN транзакции (уникальный номер)
+      - name: status
+        type: TEXT
+        nullable: false
+        default: approved
+        description: Статус (approved, declined, reversed, refunded)
+      - name: commission_rate
+        type: DECIMAL(5,4)
+        nullable: false
+        default: 0.02
+        description: Ставка комиссии
+      - name: commission_amount
+        type: DECIMAL(15,2)
+        nullable: true
+        description: Сумма комиссии
+      - name: created_at
+        type: TIMESTAMP
+        nullable: false
+        default: CURRENT_TIMESTAMP
+        description: Время создания записи
+    sample_query: SELECT at.acquiring_id, at.card_mask, at.amount, at.transaction_date, m.merchant_name FROM acquiring_transactions at JOIN terminals t ON at.terminal_id = t.terminal_id JOIN merchants m ON t.merchant_id = m.merchant_id LIMIT 5;
+
+# ============================================
+# Представления (Views)
+# ============================================
+
+views:
+  - view_id: merchant_turnover
+    view_name: merchant_turnover
+    description: Обороты по мерчантам (агрегированные данные по эквайрингу)
+    columns:
+      - name: merchant_id
+        type: INTEGER
+      - name: merchant_name
+        type: TEXT
+      - name: category
+        type: TEXT
+      - name: transaction_count
+        type: BIGINT
+      - name: total_amount
+        type: DECIMAL
+      - name: total_commission
+        type: DECIMAL
+      - name: avg_transaction
+        type: DECIMAL
+    sample_query: SELECT * FROM merchant_turnover ORDER BY total_amount DESC LIMIT 5;
+  
+  - view_id: card_activity
+    view_name: card_activity
+    description: Активность по картам (распределение по MCC-категориям)
+    columns:
+      - name: card_mask
+        type: TEXT
+      - name: mcc_code
+        type: TEXT
+      - name: mcc_description
+        type: TEXT
+      - name: category
+        type: TEXT
+      - name: transaction_count
+        type: BIGINT
+      - name: total_amount
+        type: DECIMAL
+    sample_query: SELECT * FROM card_activity ORDER BY total_amount DESC LIMIT 5;
+  
+  - view_id: daily_turnover
+    view_name: daily_turnover
+    description: Дневные обороты по эквайрингу
+    columns:
+      - name: transaction_day
+        type: DATE
+      - name: transaction_count
+        type: BIGINT
+      - name: total_amount
+        type: DECIMAL
+      - name: total_commission
+        type: DECIMAL
+    sample_query: SELECT * FROM daily_turnover ORDER BY transaction_day DESC LIMIT 5;
+
+# ============================================
+# Связи между таблицами
+# ============================================
+
+relationships:
+  - from: accounts.customer_id
+    to: customers.customer_id
+    type: many-to-one
+    
+  - from: cards.customer_id
+    to: customers.customer_id
+    type: many-to-one
+    
+  - from: cards.account_id
+    to: accounts.account_id
+    type: many-to-one
+    
+  - from: transactions.account_id
+    to: accounts.account_id
+    type: many-to-one
+    
+  - from: transactions.mcc_code
+    to: mcc_codes.mcc_code
+    type: many-to-one
+    
+  - from: merchants.customer_id
+    to: customers.customer_id
+    type: many-to-one
+    
+  - from: terminals.merchant_id
+    to: merchants.merchant_id
+    type: many-to-one
+    
+  - from: acquiring_transactions.terminal_id
+    to: terminals.terminal_id
+    type: many-to-one
+    
+  - from: acquiring_transactions.mcc_code
+    to: mcc_codes.mcc_code
+    type: many-to-one
+
+# ============================================
+# Примеры запросов для тестирования
+# ============================================
+
+example_queries:
+  - description: Топ-10 мерчантов по обороту
+    query: |
+      SELECT m.merchant_name, m.category, 
+             COUNT(at.acquiring_id) as tx_count,
+             SUM(at.amount) as total_amount
+      FROM acquiring_transactions at
+      JOIN terminals t ON at.terminal_id = t.terminal_id
+      JOIN merchants m ON t.merchant_id = m.merchant_id
+      WHERE at.status = 'approved'
+      GROUP BY m.merchant_id, m.merchant_name, m.category
+      ORDER BY total_amount DESC
+      LIMIT 10;
+    
+  - description: Транзакции клиента по карте
+    query: |
+      SELECT at.transaction_date, at.card_mask, at.amount, 
+             m.merchant_name, mc.description as mcc_description
+      FROM acquiring_transactions at
+      JOIN terminals t ON at.terminal_id = t.terminal_id
+      JOIN merchants m ON t.merchant_id = m.merchant_id
+      LEFT JOIN mcc_codes mc ON at.mcc_code = mc.mcc_code
+      WHERE at.card_mask LIKE '%1234'
+      ORDER BY at.transaction_date DESC
+      LIMIT 20;
+    
+  - description: Обороты по категориям MCC
+    query: |
+      SELECT mc.category, mc.description,
+             COUNT(*) as tx_count,
+             SUM(at.amount) as total_amount,
+             AVG(at.amount) as avg_amount
+      FROM acquiring_transactions at
+      JOIN mcc_codes mc ON at.mcc_code = mc.mcc_code
+      WHERE at.status = 'approved'
+      GROUP BY mc.category, mc.description
+      ORDER BY total_amount DESC;
+    
+  - description: Declined транзакции
+    query: |
+      SELECT at.transaction_date, at.card_mask, at.amount,
+             m.merchant_name, at.status
+      FROM acquiring_transactions at
+      JOIN terminals t ON at.terminal_id = t.terminal_id
+      JOIN merchants m ON t.merchant_id = m.merchant_id
+      WHERE at.status = 'declined'
+      ORDER BY at.transaction_date DESC;
+    
+  - description: Балансы счетов клиентов
+    query: |
+      SELECT c.name, c.customer_type, a.account_number, 
+             a.currency, a.balance, a.status
+      FROM accounts a
+      JOIN customers c ON a.customer_id = c.customer_id
+      WHERE a.status = 'active'
+      ORDER BY a.balance DESC;
