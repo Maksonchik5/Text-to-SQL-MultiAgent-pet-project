@@ -222,7 +222,7 @@ def call_sql_agent(state: MultiAgentState) -> dict:
     sql_chain = sql_agent_prompt_template | sql_llm
 
     if len(state.get('sql_messages', [])) > 0:
-        last_message = state['sql_messages']
+        last_message = state['sql_messages'][-1]
         if isinstance(last_message, ToolMessage) and last_message.name == 'sql_execute':
             returned_dict['sql_result'] = json.loads(last_message.content)['sql_result']
         elif isinstance(last_message, ToolMessage) and last_message.name == 'save_to_excel':
@@ -243,7 +243,7 @@ def call_sql_agent(state: MultiAgentState) -> dict:
         messages = state['sql_messages']
         response = sql_llm.invoke(messages)
     
-    returned_dict['response'] = response
+    returned_dict['sql_messages'] = state.get('sql_messages', []) + [response]
     return returned_dict
 
 
@@ -260,7 +260,7 @@ def need_sql_tools(state: MultiAgentState) -> str:
         if last_message.name == 'save_to_excel':
             return 'continue'
         elif last_message.name == 'sql_execute':
-            return 'tool'
+            return 'model'
     
     return 'continue'
 
@@ -289,7 +289,8 @@ graph.add_conditional_edges(
     need_sql_tools,
     {
         'tool': 'sql_agent_tools',
-        'continue': END
+        'continue': END,
+        'model': 'call_sql_agent'
     }
 )
 graph.add_edge('sql_agent_tools', 'call_sql_agent')
