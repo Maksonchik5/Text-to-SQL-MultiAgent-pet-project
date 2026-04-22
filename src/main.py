@@ -1,13 +1,17 @@
-from typing import TypedDict, NotRequired, Annotated, Sequence, List
+from typing import TypedDict, NotRequired, Annotated, Sequence, List, Any, Tuple, Dict
 from pydantic import BaseModel, Field
 import pandas as pd
 import yaml
 from dotenv import load_dotenv
 import sqlalchemy
+from sqlalchemy import text
 from pathlib import Path
 import os
 import json
 from pprint import pprint
+from tqdm import tqdm
+from functools import lru_cache
+import re
 load_dotenv()
 
 from langgraph.graph import START, END, StateGraph
@@ -18,50 +22,32 @@ from langgraph.prebuilt import ToolNode
 from langchain_openrouter import ChatOpenRouter
 from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import JsonOutputParser
-
-
+from langchain_openai import OpenAIEmbeddings
+from langchain_core.documents import Document
+from langchain_chroma import Chroma
+from langchain_community.retrievers import BM25Retriever
+from langchain_classic.retrievers.ensemble import EnsembleRetriever
 
 class MultiAgentState(TypedDict):
     messages: NotRequired[Annotated[Sequence[BaseMessage], add_messages]]
-    sql_messages: NotRequired[Annotated[Sequence[BaseMessage], add_messages]]
-    query: NotRequired[str]
+
+    user_query: NotRequired[str]
+
+    rag_top_k: NotRequired[int]
+
     table_ids: NotRequired[List[str]]
-    table_descriptions: NotRequired[List[str]]
-    sql_result: NotRequired[dict]
+    table_descriptions: NotRequired[List[Dict[str, Any]]]
+
+    sql_status: NotRequired[str] 
+    sql_result: NotRequired[Dict]
+    sql_error_type: NotRequired[str]
+    sql_error_message: NotRequired[str]
+    sql_query: NotRequired[str]
+
     filepath: NotRequired[str]
 
-
-class RAGOutput(BaseModel):
-    table_ids: List[str] = Field(description='Список ID таблиц')
-
-
-class SQLQuery(BaseModel):
-    sql_query: str = Field(description='SQL запрос для выполнения')
-    description: str = Field(description='Объяснение, что делает запрос')
-    tables_used: List[str] = Field(description='Список используемых таблиц')
-    filepath: str = Field(description='Путь до Excel файла с данными')
-
-
-main_agent_system_prompt = """
-<summary>
-Ты - агент для аналитиков, который упрощает отвечает на вопросы по данным из банковской Базы Данных. 
-Твоя задача с помощью доступных тебе инструментов получить ответ на вопрос пользователя в виде пути к Excel-файлу с нужными данными.
-</summary>
-
-<tools>
-Доступные тебе инструменты:
-1. RAG tool - инструмент, который по запросу пользователя выдает id самых релевантных таблиц для ответа на вопрос.
-2. Extract Table Descriptions - инструмент, который по переданному ему списку id таблиц вовзращает описание нужных таблиц.
-</tools>
-
-<algorithm>
-Алгоритм твоих действий:
-1. Передать запрос пользователя в RAG tool и получить из него id таблиц Базы Данных.
-2. Передать полученные на прошлом шаге id в инструмент Extract Table Descriptions и получить описание нужных таблиц.
-3. Передать полученное описание SQL агенту, не нужно его вызывать, просто заверши работу.
-</algorithm>
-"""
-
+PROJECT_DIR = Path(__file__).resolve().parent
+CHROMA_DIR = PROJECT_DIR / "chroma_langchain_db"
 
 sql_agent_prompt_template = PromptTemplate(
     template=""" 
@@ -75,64 +61,272 @@ sql_agent_prompt_template = PromptTemplate(
 <tools>
 Доступные тебе инструменты:
 1. sql_execute - инструмент для выполнения sql запроса в Базе данных. На вход принимается корректный запрос sql, а на возвращается Dictionary с полученными данными.
-2. save_to_excel - инструмент для сохранения полученных данных в Excel файл. На вход подается pandas DataFrame, а на возвращается Dictionary с путем до файла.
 </tools>
 
 <algorithm>
 Алгоритм твоих действий:
 1. По переданным запросу пользователя и описаниям таблиц сгенерируй корректный sql-запрос.
 2. Передай сгенерированный sql-запрос инструменту sql_execute и получи Dictionary.
-3. Передай полученный Dictionary в инструмент save_to_excel и получи путь до сохраненного файла.
 </algorithm>
 
 <db_schema>
 {schema}
 </db_schema>
 
-<user_query>
-{user_query}
-</user_query>
-
 <warning>
 В SQL запросах спользуй ТОЛЬКО те таблицы, которые находятся в table_descriptions.
 КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО додумывать столбцы или новые таблицы.
+Если результат sql_execute содержит ошибку, не придумывай новые таблицы и столбцы.
+Работай только с теми таблицами и столбцами, которые явно перечислены в schema.
 </warning>
     """,
-    input_variables=['schema', 'user_query']
+    input_variables=['schema']
 )
 
+engine = sqlalchemy.create_engine(
+            f'postgresql://{os.getenv("POSTGRESQL_USER")}@localhost:5432/bank_test'
+)
 
-@tool
-def rag_tool(query: str) -> RAGOutput:
+def load_schema() -> Dict:
+    with open(PROJECT_DIR / 'db_schema.yaml') as tables:
+        schema = yaml.safe_load(tables)
+    return schema
+
+def create_docs_from_yaml(schema: Dict) -> Tuple[List[Document], List]:
+    docs = []
+    ids = []
+    for table in schema['tables']:
+        table_id = table['table_id']
+        table_name = table.get('table_name', table_id)
+        table_description = table.get('description', '')
+        columns = table.get('columns', [])
+        table_columns_list = []
+
+        for column in columns:
+            column_name = column['name']
+            column_description = column.get('description', '')
+            column_type = column.get('type', '')
+
+            table_columns_list.append(column_name)
+
+            column_doc = Document(
+                page_content=(
+                    f'Колонка {table_id}.{column_name}.\n'
+                    f'Таблица {table_id}.\n'
+                    f'Описание таблицы: {table_description}.\n'
+                    f'Описание колонки: {column_description}.\n'
+                    f'Тип данных: {column_type}.'
+                ),
+                metadata={
+                    'doc_type': 'column',
+                    'table_id': table_id,
+                    'table_name': table_name,
+                    'column_name': column_name,
+                    'column_type': column_type
+                }
+            )
+
+            docs.append(column_doc)
+            ids.append(f'column:{table_id}.{column_name}')
+
+            foreign_key = column.get('foreign_key')
+            if foreign_key:
+                to_table, to_column = foreign_key.split('.')
+
+                relationship_doc = Document(
+                    page_content=(
+                        f'Связь {table_id}.{column_name}->{to_table}.{to_column}.\n'
+                        f'Таблица {table_id} связана с таблицей {to_table}.'
+                    ),
+                    metadata={
+                        'doc_type': 'relationship',
+                        'table_id': table_id,
+                        'from_table': table_id,
+                        'from_column': column_name,
+                        'to_table': to_table,
+                        'to_column': to_column
+                    }
+                )
+
+                docs.append(relationship_doc)
+                ids.append(f'relationship:{table_id}.{column_name}->{to_table}.{to_column}')
+
+        table_doc = Document(
+            page_content=(
+                f'Таблица {table_id}.\n'
+                f'Описание: {table_description}.\n'
+                f'Колонки: {", ".join(table_columns_list)}.'
+            ),
+            metadata={
+                'doc_type': 'table',
+                'table_id': table_id,
+                'table_name': table_name,
+                'columns': ', '.join(table_columns_list)
+            }
+        )
+        
+        docs.append(table_doc)
+        ids.append(f'table:{table_id}')
+    return docs, ids
+
+def get_embeddings() -> OpenAIEmbeddings:
+    embedding_model = OpenAIEmbeddings(
+        model='openai/text-embedding-3-small',
+        base_url='https://openrouter.ai/api/v1',
+        api_key=os.getenv("OPENROUTER_API_KEY")
+    )
+    return embedding_model
+
+def get_chroma_db() -> Chroma:
+    return Chroma(
+        collection_name='bank_test',
+        embedding_function=get_embeddings(),
+        persist_directory=str(CHROMA_DIR)
+    )
+
+def rebuild_chroma_db() -> None:
+    chroma_db = get_chroma_db()
+
+    existing = chroma_db.get(include=[])
+    existing_ids = existing['ids']
+
+    if existing_ids:
+        chroma_db.delete(ids=existing_ids)
+
+    create_chroma_db(chroma_db)
+
+    get_hybrid_retriever.cache_clear()
+
+def create_chroma_db(chroma_db: Chroma | None = None) -> None:
+    if not chroma_db:
+        chroma_db = get_chroma_db()
+
+    schema = load_schema()
+    docs, ids = create_docs_from_yaml(schema)
+
+    chroma_db.add_documents(documents=docs, ids=ids)
+
+def build_hybrid_retriever(top_k: int = 10) -> EnsembleRetriever:
+    chroma_db = get_chroma_db()
+
+    if chroma_db._collection.count() == 0:
+        create_chroma_db(chroma_db)
+
+    docs = []
+    items = chroma_db.get(include=['documents', 'metadatas'])
+    for doc_id, page_content, metadata in zip(
+        items['ids'],
+        items["documents"],
+        items["metadatas"]
+    ):
+        docs.append(Document(
+            page_content=page_content,
+            metadata=metadata or {},
+            id=doc_id
+        ))
+    
+    if not docs:
+        raise ValueError(
+            "Chroma collection is empty. Run create_rag_db() first."
+        )
+
+    bm25_retriever = BM25Retriever.from_documents(documents=docs, k=top_k)
+
+    mmr_retriever = chroma_db.as_retriever(
+        search_type='mmr',
+        search_kwargs={
+            'k': top_k,
+            'fetch_k': top_k*2,
+            'lambda_mult': 0.5
+        }
+    )
+
+    ensemble_retriever = EnsembleRetriever(
+        retrievers=[mmr_retriever, bm25_retriever],
+        weights=[0.7, 0.3]
+    )
+
+    return ensemble_retriever
+
+@lru_cache(maxsize=1)
+def get_hybrid_retriever(top_k: int = 10):
+    return build_hybrid_retriever(top_k=top_k)
+
+def parse_rag_output(rag_output: List[Document]) -> List[str]:
+    relevant_tables = set()
+
+    # table_pattern = re.compile(r'^table:(\w+)$')
+    # column_pattern = re.compile(r'^column:(\w+)\.(\w+)$')
+    # relationship_pattern = re.compile(r'^relationship:(\w+)\.(\w+)->(\w+)\.(\w+)$')
+
+    # for doc in rag_output:
+    #     doc_id = doc.id
+
+    #     if not doc_id:
+    #         continue
+
+    #     table_match = table_pattern.search(doc_id)
+    #     column_match = column_pattern.search(doc_id)
+    #     relationship_match = relationship_pattern.search(doc_id)
+
+    #     if table_match:
+    #         relevant_tables.add(table_match.group(1))
+    #     elif column_match:
+    #         relevant_tables.add(column_match.group(1))
+    #     elif relationship_match:
+    #         relevant_tables.add(relationship_match.group(1))
+    #         relevant_tables.add(relationship_match.group(3))
+
+    for doc in rag_output:
+        metadata = doc.metadata or {}
+        table_id = metadata.get('table_id')
+        if table_id:
+            relevant_tables.add(table_id)
+        
+        from_table = metadata.get('from_table')
+        if from_table:
+            relevant_tables.add(from_table)
+
+        to_table = metadata.get('to_table')
+        if to_table:
+            relevant_tables.add(to_table)
+
+    return list(relevant_tables)
+
+def rag(state: MultiAgentState) -> MultiAgentState:
     """Найти нужные таблицы для ответа на запрос пользователя"""
-    table_ids = 'customers'
+    user_query = state['user_query']
+    new_messages = state.get('messages', []) + [HumanMessage(content=user_query)]
+    top_k = state.get('rag_top_k', 10)
 
-    return {'table_ids': [table_ids]}
+    hybrid_retriever = get_hybrid_retriever(top_k=top_k)
+
+    rag_result = hybrid_retriever.invoke(user_query)[:top_k]
+
+    table_ids = parse_rag_output(rag_result)
+
+    return {'table_ids': table_ids, 'messages': new_messages}
 
 
-@tool
-def extract_table_descriptions(table_ids: List[str]) -> dict:
+def extract_tables_description(state: MultiAgentState) -> MultiAgentState:
     """Получение описания столбцов необходимых таблиц"""
 
-    with open('db_schema.yaml') as table_description_file:
+    with open(PROJECT_DIR / 'db_schema.yaml') as table_description_file:
         schema = yaml.safe_load(table_description_file)
 
     table_descriptions = []
     
     for table in schema['tables']:
-        if table['table_id'] in table_ids:
+        if table['table_id'] in state['table_ids']:
             table_descriptions.append(table)
 
     return {'table_descriptions': table_descriptions}
 
 
 @tool
-def sql_execute(query: str) -> dict:
+def sql_execute(query: str) -> Dict:
     """Подключение к Базе данных и выполнение запроса query"""
     try:
-        engine = sqlalchemy.create_engine(
-            f'postgresql://{os.getenv("POSTGRESQL_USER")}:{os.getenv("POSTGRESQL_PASSWORD")}@localhost:5432/bank_test'
-        )
 
         with engine.connect() as conn:
             df = pd.read_sql(query, conn)
@@ -149,12 +343,52 @@ def sql_execute(query: str) -> dict:
             'query': query
         }
 
+sql_agent_tools = [sql_execute]
 
-@tool
-def save_to_excel(user_query: str, df: dict) -> dict:
+sql_llm = ChatOpenRouter(
+    model='qwen/qwen3-235b-a22b-2507',
+    api_key=os.getenv("OPENROUTER_API_KEY")
+).bind_tools(sql_agent_tools)
+
+def generate_sql(state: MultiAgentState) -> MultiAgentState:
+    tables_description = state.get('table_descriptions', [])
+
+    table_schema = '\n\n'.join([
+            f"Table: {t['table_id']}\n" +
+            '\n'.join([f"  - {c['name']} ({c['type']}): {c.get('description', '')}" 
+                    for c in t['columns']])
+            for t in tables_description
+        ])
+
+    sql_system_prompt = sql_agent_prompt_template.format(schema=table_schema)
+
+    result = sql_llm.invoke(input=[SystemMessage(content=sql_system_prompt), state['user_query']])
+    new_messages = state.get('messages', []) + [result]
+    return {'messages': new_messages}
+
+def should_sql_continue(state: MultiAgentState) -> str:
+    last_message = state['messages'][-1]
+    if last_message.tool_calls:
+        return 'tool'
+    return 'end'
+
+def shoul_regenerate_sql(state: MultiAgentState) -> str:
+    last_message = state['messages'][-1]
+    if isinstance(last_message, ToolMessage):
+        sql_result = json.loads(last_message.content).get('sql_result', {})
+        if len(sql_result) > 0:
+            return 'save_to_excel'
+        else:
+            return 'regenerate'
+    return 'regenerate'
+
+def save_to_excel(state: MultiAgentState) -> MultiAgentState:
     """Сохранение результатов запроса в Excel файл"""
 
-    df = pd.DataFrame(df)
+    last_message = state['messages'][-1]
+    sql_result = json.loads(last_message.content).get('sql_result', {})
+    user_query = state['user_query']
+    df = pd.DataFrame(sql_result)
 
     dirname = Path.cwd() / 'output'
     dirname.mkdir(exist_ok=True)
@@ -163,140 +397,37 @@ def save_to_excel(user_query: str, df: dict) -> dict:
 
     df.to_excel(filepath, index=False)
 
-    return {'filepath': str(filepath)}
+    return {'filepath': str(filepath), 'sql_result': sql_result}
 
+def main():
+    graph = StateGraph(MultiAgentState)
 
-main_agent_tools = [rag_tool, extract_table_descriptions]
-sql_agent_tools = [sql_execute, save_to_excel]
+    graph.add_node('rag', rag)
+    graph.add_node('extract_tables_description', extract_tables_description)
+    graph.add_node('generate_sql', generate_sql)
+    sql_tools = ToolNode(sql_agent_tools)
+    graph.add_node('sql_tools', sql_tools)
+    graph.add_node('save_to_excel', save_to_excel)
 
+    graph.set_entry_point('rag')
+    graph.add_edge('rag', 'extract_tables_description')
+    graph.add_edge('extract_tables_description', 'generate_sql')
+    graph.add_conditional_edges(
+        'generate_sql',
+        should_sql_continue,
+        {'tool': 'sql_tools', 'end': END}
+    )
+    graph.add_conditional_edges(
+        'sql_tools',
+        shoul_regenerate_sql,
+        {'regenerate': 'generate_sql', 'save_to_excel': 'save_to_excel'}
+    )
+    graph.add_edge('save_to_excel', END)
 
-main_llm = ChatOpenRouter(
-    model='qwen/qwen3-235b-a22b-2507',
-    api_key=os.getenv("OPENROUTER_API_KEY")
-).bind_tools(main_agent_tools)
-
-sql_llm = ChatOpenRouter(
-    model='qwen/qwen3-235b-a22b-2507',
-    api_key=os.getenv("OPENROUTER_API_KEY")
-).bind_tools(sql_agent_tools)
-
-
-def model_call(state: MultiAgentState) -> dict:
-    returned_dict = {}
-
-    if len(state.get('messages', [])) > 0:
-        last_message = state['messages'][-1]
-        if isinstance(last_message, ToolMessage) and last_message.name == 'extract_table_descriptions':
-            table_descriptions = json.loads(last_message.content)
-            returned_dict['table_descriptions'] = table_descriptions['table_descriptions']
-        
-        elif isinstance(last_message, ToolMessage) and last_message.name == 'rag_tool':
-            returned_dict['table_ids'] = json.loads(last_message.content)['table_ids']
-            
-
-    if len(state.get('messages', [])) == 0:
-        query = input('Вы: ')
-        returned_dict['query'] = query
-
-        new_messages = [SystemMessage(content=main_agent_system_prompt)] + [HumanMessage(content=query)]
-    else:
-        new_messages = state.get('messages', [])
-        
-    response = main_llm.invoke(new_messages)
-
-    returned_dict['messages'] = new_messages + [response]
-
-    return returned_dict
-
-
-def need_tools(state: MultiAgentState) -> str:
-    last_message = state.get('messages', [])[-1]
-
-    if isinstance(last_message, AIMessage) and last_message.tool_calls:
-        return 'tool'
-    return 'continue'
-
-
-def call_sql_agent(state: MultiAgentState) -> dict: 
-    returned_dict = {}   
-    sql_chain = sql_agent_prompt_template | sql_llm
-
-    if len(state.get('sql_messages', [])) > 0:
-        last_message = state['sql_messages'][-1]
-        if isinstance(last_message, ToolMessage) and last_message.name == 'sql_execute':
-            returned_dict['sql_result'] = json.loads(last_message.content)['sql_result']
-        elif isinstance(last_message, ToolMessage) and last_message.name == 'save_to_excel':
-            returned_dict['filepath'] = json.loads(last_message.content)['filepath']
-    if len(state.get('sql_messages', [])) == 0:
-        user_query = state.get('query', '')
-        table_descriptions = state.get('table_descriptions', [])
-
-        table_schema = '\n\n'.join([
-            f"Table: {t['table_id']}\n" +
-            '\n'.join([f"  - {c['name']} ({c['type']}): {c.get('description', '')}" 
-                    for c in t['columns']])
-            for t in table_descriptions
-        ])
-
-        response = sql_chain.invoke({'schema': table_schema, 'user_query': user_query})
-    else:
-        messages = state['sql_messages']
-        response = sql_llm.invoke(messages)
-    
-    returned_dict['sql_messages'] = state.get('sql_messages', []) + [response]
-    return returned_dict
-
-
-def need_sql_tools(state: MultiAgentState) -> str:
-    last_message = state['sql_messages'][-1] if state.get('sql_messages') else None
-    
-    if last_message is None:
-        return 'continue'
-    
-    if isinstance(last_message, AIMessage) and last_message.tool_calls:
-        return 'tool'
-    
-    if isinstance(last_message, ToolMessage):
-        if last_message.name == 'save_to_excel':
-            return 'continue'
-        elif last_message.name == 'sql_execute':
-            return 'model'
-    
-    return 'continue'
-
-
-graph = StateGraph(MultiAgentState)
-
-graph.add_node('model_call', model_call)
-main_agent_tools_node = ToolNode(tools=main_agent_tools)
-graph.add_node('main_agent_tools', main_agent_tools_node)
-graph.add_node('call_sql_agent', call_sql_agent)
-sql_agents_tools_node = ToolNode(tools=sql_agent_tools)
-graph.add_node('sql_agent_tools', sql_agents_tools_node)
-
-graph.add_edge(START, 'model_call')
-graph.add_conditional_edges(
-    "model_call", 
-    need_tools, 
-    {
-        'tool': 'main_agent_tools',
-        'continue': 'call_sql_agent'
-    }
-)
-graph.add_edge('main_agent_tools', 'model_call')
-graph.add_conditional_edges(
-    'call_sql_agent',
-    need_sql_tools,
-    {
-        'tool': 'sql_agent_tools',
-        'continue': END,
-        'model': 'call_sql_agent'
-    }
-)
-graph.add_edge('sql_agent_tools', 'call_sql_agent')
-
-app = graph.compile()
+    return graph.compile()
 
 if __name__ == '__main__':
-    result = app.invoke({})
+    app = main()
+    user_input = input('Ваш запрос: ')
+    result = app.invoke({'user_query': user_input})
     pprint(result)
