@@ -307,7 +307,6 @@ def rag(state: MultiAgentState) -> MultiAgentState:
 
     return {'table_ids': table_ids, 'messages': new_messages}
 
-
 def extract_tables_description(state: MultiAgentState) -> MultiAgentState:
     """Получение описания столбцов необходимых таблиц"""
 
@@ -321,7 +320,6 @@ def extract_tables_description(state: MultiAgentState) -> MultiAgentState:
             table_descriptions.append(table)
 
     return {'table_descriptions': table_descriptions}
-
 
 @tool
 def sql_execute(query: str) -> Dict:
